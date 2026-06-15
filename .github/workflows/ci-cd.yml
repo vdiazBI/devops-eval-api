@@ -1,1 +1,143 @@
+name: CI/CD Pipeline
+on:
+  push:
+    branches: [ dev, main ]  
+  
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run tests with coverage
+        run: npm test
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/lcov-report/
+  
+  sonar-analysis:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # necesario para blame/history en Sonar
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      - run: npm test             # regenera coverage/lcov.info
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  
+  security-scan:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: npm audit
+        run: npm audit --audit-level=high
+
+      - name: Run Trivy (filesystem / dependencias)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: Build image for scanning
+        run: docker build -t app:scan .
+
+      - name: Run Trivy (image)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: 'app:scan'
+          format: 'table'
+          severity: 'CRITICAL'
+          exit-code: '1'
+
+  publish-artifact:
+    needs: [sonar-analysis, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/devops-eval-api
+          docker build \
+            -t $IMAGE:${{ vars.APP_VERSION }} \
+            -t $IMAGE:latest \
+            -t $IMAGE:${{ github.sha }} .
+          docker push $IMAGE --all-tags
+
+      - name: Create GitHub Release
+        run: |
+          gh release create v${{ vars.APP_VERSION }}-${{ github.run_number }} \
+            --title "Release ${{ vars.APP_VERSION }} (#${{ github.run_number }})" \
+            --notes "Automated release from CI/CD pipeline" \
+            --target main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    needs: [publish-artifact]
+    runs-on: ubuntu-latest
+    environment: production        # requiere aprobación manual en GitHub
+    steps:
+      - name: Trigger Render deployment
+        run: |
+          curl -s -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+
+      - name: Wait and health check
+        run: |
+          echo "Waiting for Render cold start..."
+          sleep 60
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://<tu-app>.onrender.com/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed — HTTP $STATUS"
+            exit 1
+          fi
+          echo "Deployment successful — HTTP $STATUS"
